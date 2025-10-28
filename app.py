@@ -1,9 +1,11 @@
 import logging
 from flask import Flask, request, jsonify, redirect
+from flask_cors import CORS
 from typing import Optional, TypedDict, cast
 import mysql.connector
 import nanoid
 from uuid import uuid4
+from datetime import datetime, timedelta
 from auth import hash_password, check_password, create_refresh_token, create_access_token, jwt_required,hash_token
 import validators
 from errors import handle_errors, APIError
@@ -17,6 +19,19 @@ from metrics import REQUEST_COUNT,REQUEST_LATENCY
 import time
 import json
 from fraud import get_fingerprint
+
+# Import new modules
+from api_docs import get_api_blueprint, get_namespaces
+from health import health_check, health_check_lite, readiness_check, liveness_check
+from validation import validate_signup_data, validate_shorten_request, ValidationError
+from url_features import (
+    url_expiration_manager, custom_domain_manager, bulk_url_manager,
+    url_analytics_manager, url_preview_manager
+)
+from security import (
+    setup_security_middleware, security_config, input_sanitizer,
+    detect_attacks, sanitize_input, validate_content_type
+)
     
 log_click_task = cast(Task, log_click)
 check_fraud_task=cast(Task,check_fraud)
@@ -60,6 +75,25 @@ class URLClickRow(TypedDict):
 # App + Config
 # ---------------------------
 app = Flask(__name__)
+
+# Enable CORS for all routes
+CORS(app, origins=security_config.CORS_ORIGINS, 
+     methods=security_config.CORS_METHODS,
+     allow_headers=security_config.CORS_HEADERS)
+
+# Setup security middleware
+setup_security_middleware(app)
+
+# Register API documentation blueprint
+api_bp = get_api_blueprint()
+app.register_blueprint(api_bp)
+
+# Get API namespaces for route registration
+namespaces = get_namespaces()
+auth_ns = namespaces['auth']
+url_ns = namespaces['urls']
+analytics_ns = namespaces['analytics']
+admin_ns = namespaces['admin']
 
 
 def get_client_ip():
@@ -130,12 +164,50 @@ def metrics():
     return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
 
 # ---------------------------
+# Health Check Routes
+# ---------------------------
+@app.route('/health')
+def health_endpoint():
+    """Comprehensive health check endpoint"""
+    return health_check()
+
+@app.route('/health/lite')
+def health_lite_endpoint():
+    """Lightweight health check for load balancers"""
+    return health_check_lite()
+
+@app.route('/ready')
+def readiness_endpoint():
+    """Readiness check for Kubernetes"""
+    return readiness_check()
+
+@app.route('/live')
+def liveness_endpoint():
+    """Liveness check for Kubernetes"""
+    return liveness_check()
+
+# ---------------------------
 # Auth routes
 # ---------------------------
 @app.route("/auth/signup", methods=["POST"])
 @handle_errors
+@detect_attacks
+@sanitize_input
+@validate_content_type(['application/json'])
 def signup():
     data = request.get_json()
+    if not data:
+        return jsonify({"error": "Request body is required"}), 400
+    
+    # Enhanced validation
+    validation_result = validate_signup_data(data)
+    if not validation_result['valid']:
+        return jsonify({
+            "error": "Validation failed",
+            "details": validation_result['errors'],
+            "warnings": validation_result['warnings']
+        }), 400
+    
     username: str = data["username"]
     password: str = data["password"]
 
@@ -153,6 +225,9 @@ def signup():
     except mysql.connector.errors.IntegrityError:
         logger.warning(f"Signup failed: Username {username} already exists")
         return jsonify({"msg": "Username already exists"}), 400
+    except Exception as e:
+        logger.error(f"Signup error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
     finally:
         cursor.close()
         safe_close(conn)
@@ -243,37 +318,65 @@ def logout():
 @app.route("/shorten", methods=["POST"])
 @jwt_required(token_type="access")
 @handle_errors
+@detect_attacks
+@sanitize_input
+@validate_content_type(['application/json'])
 def shorten_url():
     user_id: str = request.environ["user_id"]
     data = request.get_json()
-    original_url: str = data["url"]
+    
+    if not data:
+        return jsonify({"error": "Request body is required"}), 400
+    
+    # Enhanced validation
+    validation_result = validate_shorten_request(data)
+    if not validation_result['valid']:
+        return jsonify({
+            "error": "Validation failed",
+            "details": validation_result['errors'],
+            "warnings": validation_result['warnings']
+        }), 400
+    
+    # Use sanitized URL from validation
+    original_url: str = validation_result['sanitized_data']['url']
     code: str = data.get("code")
+    
     ip_addr=get_client_ip()
     if ip_addr is None:
-        return jsonify({}),429
+        return jsonify({"error": "Unable to determine client IP"}), 400
+    
     if not check_rate_limit(user_id) or not check_ip_rate_limit(ip_addr):
         logger.warning(f"Rate limit exceeded for user {user_id}")
         return jsonify({"error": f"Rate limit exceeded: {RATE_LIMIT} requests per minute"}), 429
 
-    if not validators.url(original_url):
-        logger.warning(f"Invalid URL submitted by user {user_id}: {original_url}")
-        return jsonify({"error": "Invalid URL"}), 400
-
     if not code:
         code = nanoid.generate(size=8)
+    
     conn=get_connection()
     cursor= conn.cursor(dictionary=True)    
-    cursor.execute(
-        "INSERT INTO urls (id, code, original_url, user_id) VALUES (%s, %s, %s, %s)",
-        (str(uuid4()), code, original_url, user_id),
-    )
-    conn.commit()
-    cursor.close()
-    safe_close(conn)
-    redis_client.set(code, original_url, ex=86400)  # cache 1 day
-    logger.info(f"URL shortened by user {user_id}: {original_url} -> {code}")
+    try:
+        cursor.execute(
+            "INSERT INTO urls (id, code, original_url, user_id) VALUES (%s, %s, %s, %s)",
+            (str(uuid4()), code, original_url, user_id),
+        )
+        conn.commit()
+        redis_client.set(code, original_url, ex=86400)  # cache 1 day
+        logger.info(f"URL shortened by user {user_id}: {original_url} -> {code}")
 
-    return jsonify({"short_url": f"http://localhost:5000/{code}"})
+        return jsonify({
+            "short_url": f"http://localhost:5000/{code}",
+            "code": code,
+            "original_url": original_url
+        })
+    except mysql.connector.errors.IntegrityError as e:
+        logger.warning(f"Short code conflict: {code}")
+        return jsonify({"error": "Short code already exists"}), 409
+    except Exception as e:
+        logger.error(f"URL shortening error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+    finally:
+        cursor.close()
+        safe_close(conn)
 
 
 @app.route("/<code>")
@@ -392,6 +495,161 @@ def get_trendings():
     if not trending_json:
         return jsonify([]), 200
     return jsonify(json.loads(trending_json)), 200  # type: ignore
+
+# ---------------------------
+# Enhanced URL Features
+# ---------------------------
+
+@app.route("/urls/<url_id>/expire", methods=["POST"])
+@jwt_required(token_type="access")
+@handle_errors
+def set_url_expiration(url_id: str):
+    """Set expiration date for a URL"""
+    user_id: str = request.environ["user_id"]
+    data = request.get_json()
+    
+    if not data or 'expires_in_hours' not in data:
+        return jsonify({"error": "expires_in_hours is required"}), 400
+    
+    expires_in_hours = data['expires_in_hours']
+    if not isinstance(expires_in_hours, (int, float)) or expires_in_hours <= 0:
+        return jsonify({"error": "expires_in_hours must be a positive number"}), 400
+    
+    # Check if user owns the URL
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT user_id FROM urls WHERE id = %s", (url_id,))
+        url_row = cursor.fetchone()
+        
+        if not url_row or url_row['user_id'] != user_id:
+            return jsonify({"error": "URL not found or unauthorized"}), 404
+        
+        # Set expiration
+        expires_at = datetime.utcnow() + timedelta(hours=expires_in_hours)
+        success = url_expiration_manager.add_expiration_to_url(url_id, expires_at)
+        
+        if success:
+            return jsonify({
+                "message": "Expiration set successfully",
+                "expires_at": expires_at.isoformat()
+            })
+        else:
+            return jsonify({"error": "Failed to set expiration"}), 500
+            
+    finally:
+        cursor.close()
+        safe_close(conn)
+
+@app.route("/urls/bulk", methods=["POST"])
+@jwt_required(token_type="access")
+@handle_errors
+def bulk_shorten_urls():
+    """Shorten multiple URLs in a single request"""
+    user_id: str = request.environ["user_id"]
+    data = request.get_json()
+    
+    if not data or 'urls' not in data:
+        return jsonify({"error": "urls array is required"}), 400
+    
+    urls = data['urls']
+    if not isinstance(urls, list) or len(urls) == 0:
+        return jsonify({"error": "urls must be a non-empty array"}), 400
+    
+    result = bulk_url_manager.bulk_shorten_urls(urls, user_id)
+    
+    if result['success']:
+        return jsonify(result)
+    else:
+        return jsonify(result), 400
+
+@app.route("/urls/<url_id>/preview", methods=["GET"])
+@jwt_required(token_type="access")
+@handle_errors
+def get_url_preview(url_id: str):
+    """Get preview information for a URL"""
+    user_id: str = request.environ["user_id"]
+    
+    # Check if user owns the URL
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT user_id FROM urls WHERE id = %s", (url_id,))
+        url_row = cursor.fetchone()
+        
+        if not url_row or url_row['user_id'] != user_id:
+            return jsonify({"error": "URL not found or unauthorized"}), 404
+        
+        preview = url_preview_manager.get_url_preview(url_id)
+        
+        if 'error' in preview:
+            return jsonify(preview), 404
+        
+        return jsonify(preview)
+        
+    finally:
+        cursor.close()
+        safe_close(conn)
+
+@app.route("/urls/<url_id>/performance", methods=["GET"])
+@jwt_required(token_type="access")
+@handle_errors
+def get_url_performance(url_id: str):
+    """Get performance metrics for a URL"""
+    user_id: str = request.environ["user_id"]
+    days = request.args.get('days', 30, type=int)
+    
+    # Check if user owns the URL
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT user_id FROM urls WHERE id = %s", (url_id,))
+        url_row = cursor.fetchone()
+        
+        if not url_row or url_row['user_id'] != user_id:
+            return jsonify({"error": "URL not found or unauthorized"}), 404
+        
+        metrics = url_analytics_manager.get_url_performance_metrics(url_id, days)
+        
+        if 'error' in metrics:
+            return jsonify(metrics), 500
+        
+        return jsonify(metrics)
+        
+    finally:
+        cursor.close()
+        safe_close(conn)
+
+@app.route("/urls/<url_id>/delete", methods=["DELETE"])
+@jwt_required(token_type="access")
+@handle_errors
+def delete_url(url_id: str):
+    """Delete a URL"""
+    user_id: str = request.environ["user_id"]
+    
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        # Check if user owns the URL
+        cursor.execute("SELECT user_id, code FROM urls WHERE id = %s", (url_id,))
+        url_row = cursor.fetchone()
+        
+        if not url_row or url_row['user_id'] != user_id:
+            return jsonify({"error": "URL not found or unauthorized"}), 404
+        
+        # Delete the URL (cascade will handle related records)
+        cursor.execute("DELETE FROM urls WHERE id = %s", (url_id,))
+        conn.commit()
+        
+        # Remove from Redis cache
+        redis_client.delete(url_row['code'])
+        
+        logger.info(f"URL {url_id} deleted by user {user_id}")
+        return jsonify({"message": "URL deleted successfully"})
+        
+    finally:
+        cursor.close()
+        safe_close(conn)
 
 
 
