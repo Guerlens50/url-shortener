@@ -13,6 +13,11 @@ pyyaml
 ua-parser 
 user-agents
 python-dotenv
+flask-restx
+flask-cors
+marshmallow
+apispec
+apispec-webframeworks
 
 
 pytest
